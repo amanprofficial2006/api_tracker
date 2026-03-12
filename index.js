@@ -12,6 +12,12 @@ const app = express();
 const port = process.env.PORT || 3000;
 const backendUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
 const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+const defaultAllowedOrigins = ['http://localhost:3000', 'http://localhost:5173', 'https://api-runner.onrender.com'];
+const envAllowedOrigins = String(process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean);
+const allowedOrigins = [...new Set([...defaultAllowedOrigins, frontendUrl, ...envAllowedOrigins])];
 const mongoUri = process.env.MONGO_URI;
 const mongoDbName = process.env.MONGO_DB_NAME || 'api_tracker';
 const hasGoogleOAuth =
@@ -84,8 +90,13 @@ async function upsertUserInDatabase(user) {
 }
 
 // Middleware
+app.set('trust proxy', 1);
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173'], // backend & vite dev
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
   credentials: true
 }));
 app.use(express.json());
@@ -93,7 +104,11 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'fallback-secret-change-me',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 } // 24h
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    maxAge: 24 * 60 * 60 * 1000
+  } // 24h
 }));
 app.use(passport.initialize());
 app.use(passport.session());
