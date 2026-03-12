@@ -4,8 +4,6 @@ const session = require('express-session');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
 const { MongoClient, ObjectId } = require('mongodb');
 const { normalizeRequestBodyForUpstream, parseFormDataLines, formDataObjectToLines, formFilesToLines } = require('./requestBody');
 
@@ -163,7 +161,7 @@ app.get('/auth/google/callback',
     return passport.authenticate('google', { failureRedirect: `${frontendUrl}/?error=auth_failed` })(req, res, next);
   },
   (req, res) => {
-    // Success - hand control back to frontend dashboard; user is restored from session.
+    // Success - hand control back to client app; user is restored from session.
     res.redirect(`${frontendUrl}/dashboard`);
   }
 );
@@ -865,25 +863,6 @@ app.post('/api/track', (req, res) => {
   res.json({ message: 'API call tracked', data: req.body, user: req.user || null });
 });
 
-// Serve Frontend only when build exists.
-const frontendDistPath = path.join(__dirname, 'dist');
-const frontendIndexPath = path.join(frontendDistPath, 'index.html');
-const hasFrontendBuild = fs.existsSync(frontendIndexPath);
-
-if (hasFrontendBuild) {
-  app.use(express.static(frontendDistPath));
-
-  // React Router fallback (skip API/Auth routes).
-  app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api') || req.path.startsWith('/auth')) {
-      return next();
-    }
-    return res.sendFile(frontendIndexPath);
-  });
-} else {
-  console.warn('Frontend build not found at dist. Running in API-only mode.');
-}
-
 // Final 404 for unmatched API/Auth/other routes.
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
@@ -895,7 +874,6 @@ app.use((req, res) => {
     app.listen(port, () => {
       console.log(`API Tracker running at http://localhost:${port}`);
       console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
-      console.log('Frontend dev: cd frontend && npm run dev');
     });
   } catch (error) {
     console.error('Database initialization failed:', error.message);

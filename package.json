@@ -1,20 +1,17 @@
 {
   "name": "api_tracker",
   "version": "1.0.0",
-  "description": "A Node.js API tracker application with Google OAuth and React dashboard",
+  "description": "A Node.js API tracker application with Google OAuth",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node tests/requestBody.test.js",
-    "build:frontend": "cd frontend && npm run build",
-    "build": "npm run build:frontend && echo 'Frontend built! Run npm start for prod.'"
+    "test": "node tests/requestBody.test.js"
   },
   "keywords": [
     "api",
     "tracker",
     "nodejs",
-    "react",
     "oauth"
   ],
   "author": "",
