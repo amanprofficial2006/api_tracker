@@ -31,14 +31,17 @@ const inviteAppUrl = String(process.env.INVITE_APP_URL || frontendUrl || 'http:/
 const hasSmtpConfig = Boolean(smtpHost && smtpPort && smtpUser && smtpPass && inviteEmailFrom);
 const mailTransporter = hasSmtpConfig
   ? nodemailer.createTransport({
+
     host: smtpHost,
     port: smtpPort,
-    secure: smtpSecure,
+    secure: false,
+    family: 4, // IPv4 - fixes Render IPv6 ENETUNREACH
     auth: {
       user: smtpUser,
       pass: smtpPass
     }
   })
+
   : null;
 const hasGoogleOAuth =
   Boolean(process.env.GOOGLE_CLIENT_ID) &&
@@ -1140,7 +1143,8 @@ app.use((req, res) => {
     await initDatabase();
     app.listen(port, () => {
       console.log(`API Tracker running at http://localhost:${port}`);
-      console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
+console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
+      console.log('Invite Email SMTP: ' + smtpHost + ':' + smtpPort + ' user:' + smtpUser.slice(0,3) + '***');
 
     });
   } catch (error) {
