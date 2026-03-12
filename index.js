@@ -871,13 +871,6 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'frontend/dist/index.html'));
 });
 
-// For dev: Proxy to Vite? Optional - use vite proxy config instead.
-
-// 404 fallback
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
 (async () => {
   try {
     await initDatabase();
