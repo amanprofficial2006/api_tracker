@@ -1141,7 +1141,7 @@ app.use((req, res) => {
     app.listen(port, () => {
       console.log(`API Tracker running at http://localhost:${port}`);
       console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
-console.log(`Invite Email: ${hasSmtpConfig ? `Configured (host:${smtpHost}, port:${smtpPort}, user:${smtpUser.slice(0,3)}***, from:${inviteEmailFrom})` : 'NOT CONFIGURED - Add SMTP_HOST,SMTP_PORT,SMTP_USER,SMTP_PASS,INVITE_EMAIL_FROM to Backend/.env'}`);
+
     });
   } catch (error) {
     console.error('Database initialization failed:', error.message);
