@@ -28,6 +28,9 @@ const smtpPass = String(process.env.SMTP_PASS || '').replace(/\s+/g, '');
 const inviteEmailFrom = String(process.env.INVITE_EMAIL_FROM || smtpUser || '').trim();
 const inviteFromName = String(process.env.SMTP_FROM_NAME || 'API Runner').trim();
 const inviteAppUrl = String(process.env.INVITE_APP_URL || frontendUrl || 'http://localhost:5173').trim();
+const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
+const resendFromEmail = String(process.env.RESEND_FROM || inviteEmailFrom || 'onboarding@resend.dev').trim();
+const hasResendConfig = Boolean(resendApiKey && resendFromEmail);
 const hasSmtpConfig = Boolean(smtpHost && smtpPort && smtpUser && smtpPass && inviteEmailFrom);
 const mailTransporter = hasSmtpConfig
   ? nodemailer.createTransport({
@@ -408,6 +411,39 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+async function sendWithResendEmail({ toEmail, subject, html, text }) {
+  if (!hasResendConfig) return { sent: false, reason: 'resend_not_configured' };
+
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: `"${inviteFromName}" <${resendFromEmail}>`,
+        to: [toEmail],
+        subject,
+        html,
+        text
+      })
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const msg = data?.message || data?.error || response.statusText;
+      throw new Error(msg);
+    }
+
+    console.log(`Resend: SUCCESS - Email sent to ${toEmail}, id: ${data.id || 'n/a'}`);
+    return { sent: true, provider: 'resend', id: data.id || null };
+  } catch (error) {
+    console.error(`Resend: ERROR - failed to send to ${toEmail}:`, error.message);
+    return { sent: false, reason: 'resend_error', details: error.message };
+  }
+}
+
 async function sendCollaboratorInviteEmail({
   toEmail,
   toName = '',
@@ -416,10 +452,6 @@ async function sendCollaboratorInviteEmail({
   addedAsCollaborator = false
 }) {
   const safeToEmail = normalizeEmail(toEmail);
-  if (!mailTransporter) {
-    console.log(`SMTP ERROR: No transporter - check SMTP config. Skipping email to ${safeToEmail}`);
-    return { sent: false, reason: 'smtp_not_configured' };
-  }
   if (!safeToEmail) {
     return { sent: false, reason: 'invalid_email' };
   }
@@ -433,12 +465,11 @@ async function sendCollaboratorInviteEmail({
     ? `You were added as a collaborator on <b>${escapeHtml(projectName)}</b>.`
     : `You are invited to collaborate on <b>${escapeHtml(projectName)}</b>.`;
 
-console.log(`SMTP: Sending email to ${safeToEmail}, subject: "${subject}", from: ${inviteEmailFrom}`);
-  await mailTransporter.sendMail({
-    from: `"${inviteFromName}" <${inviteEmailFrom}>`,
-    to: safeToEmail,
-    subject,
-    html: `
+  if (hasResendConfig) {
+    const resendResult = await sendWithResendEmail({
+      toEmail: safeToEmail,
+      subject,
+      html: `
       <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827">
         <p>${greeting}</p>
         <p>${escapeHtml(ownerName)} has sent you an invite from API Runner.</p>
@@ -450,7 +481,7 @@ console.log(`SMTP: Sending email to ${safeToEmail}, subject: "${subject}", from:
         <p style="margin-top:20px">Thanks,<br/>API Runner Team</p>
       </div>
     `,
-    text: `${toName ? `Hi ${toName},` : 'Hi,'}
+      text: `${toName ? `Hi ${toName},` : 'Hi,'}
 
 ${ownerName} has sent you an invite from API Runner.
 ${addedAsCollaborator ? `You were added as a collaborator on "${projectName}".` : `You are invited to collaborate on "${projectName}".`}
@@ -458,7 +489,49 @@ Open API Runner: ${safeInviteUrl}
 
 Thanks,
 API Runner Team`
-  });
+    });
+
+    if (resendResult.sent) return resendResult;
+    if (!mailTransporter) return resendResult;
+    console.log(`Resend: falling back to SMTP for ${safeToEmail} due to error: ${resendResult.details || resendResult.reason}`);
+  }
+
+  if (!mailTransporter) {
+    console.log(`SMTP ERROR: No transporter - check SMTP config. Skipping email to ${safeToEmail}`);
+    return { sent: false, reason: 'smtp_not_configured' };
+  }
+
+console.log(`SMTP: Sending email to ${safeToEmail}, subject: "${subject}", from: ${inviteEmailFrom}`);
+  try {
+    await mailTransporter.sendMail({
+      from: `"${inviteFromName}" <${inviteEmailFrom}>`,
+      to: safeToEmail,
+      subject,
+      html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827">
+        <p>${greeting}</p>
+        <p>${escapeHtml(ownerName)} has sent you an invite from API Runner.</p>
+        <p>${intro}</p>
+        <p>
+          Open API Runner:
+          <a href="${safeInviteUrl}" target="_blank" rel="noreferrer">${safeInviteUrl}</a>
+        </p>
+        <p style="margin-top:20px">Thanks,<br/>API Runner Team</p>
+      </div>
+    `,
+      text: `${toName ? `Hi ${toName},` : 'Hi,'}
+
+${ownerName} has sent you an invite from API Runner.
+${addedAsCollaborator ? `You were added as a collaborator on "${projectName}".` : `You are invited to collaborate on "${projectName}".`}
+Open API Runner: ${safeInviteUrl}
+
+Thanks,
+API Runner Team`
+    });
+  } catch (error) {
+    console.error(`SMTP: ERROR - Email failed for ${safeToEmail}:`, error.message);
+    return { sent: false, reason: 'smtp_error', details: error.message };
+  }
 
   console.log(`SMTP: SUCCESS - Email sent to ${safeToEmail}`);
   return { sent: true };
@@ -1167,7 +1240,8 @@ app.use((req, res) => {
     await initDatabase();
     app.listen(port, () => {
       console.log(`API Tracker running at http://localhost:${port}`);
-console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
+      console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
+      console.log(hasResendConfig ? `Invite Email Resend: Configured (from:${resendFromEmail})` : 'Invite Email Resend: Not configured');
       console.log('Invite Email SMTP: ' + smtpHost + ':' + smtpPort + ' user:' + smtpUser.slice(0,3) + '***');
 
     });
