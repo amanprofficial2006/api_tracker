@@ -866,7 +866,7 @@ app.post('/api/track', (req, res) => {
 });
 
 // Serve Frontend only when build exists.
-const frontendDistPath = path.join(__dirname, 'frontend', 'dist');
+const frontendDistPath = path.join(__dirname, 'dist');
 const frontendIndexPath = path.join(frontendDistPath, 'index.html');
 const hasFrontendBuild = fs.existsSync(frontendIndexPath);
 
@@ -881,7 +881,7 @@ if (hasFrontendBuild) {
     return res.sendFile(frontendIndexPath);
   });
 } else {
-  console.warn('Frontend build not found at frontend/dist. Running in API-only mode.');
+  console.warn('Frontend build not found at dist. Running in API-only mode.');
 }
 
 // Final 404 for unmatched API/Auth/other routes.
