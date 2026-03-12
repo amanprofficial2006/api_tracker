@@ -4,6 +4,7 @@ const session = require('express-session');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const cors = require('cors');
+const nodemailer = require('nodemailer');
 const { MongoClient, ObjectId } = require('mongodb');
 const { normalizeRequestBodyForUpstream, parseFormDataLines, formDataObjectToLines, formFilesToLines } = require('./requestBody');
 
@@ -19,6 +20,26 @@ const envAllowedOrigins = String(process.env.CORS_ORIGINS || '')
 const allowedOrigins = [...new Set([...defaultAllowedOrigins, frontendUrl, ...envAllowedOrigins])];
 const mongoUri = process.env.MONGO_URI;
 const mongoDbName = process.env.MONGO_DB_NAME || 'api_tracker';
+const smtpHost = String(process.env.SMTP_HOST || '').trim();
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+const smtpSecure = String(process.env.SMTP_SECURE || '').trim().toLowerCase() === 'true';
+const smtpUser = String(process.env.SMTP_USER || '').trim();
+const smtpPass = String(process.env.SMTP_PASS || '').replace(/\s+/g, '');
+const inviteEmailFrom = String(process.env.INVITE_EMAIL_FROM || smtpUser || '').trim();
+const inviteFromName = String(process.env.SMTP_FROM_NAME || 'API Runner').trim();
+const inviteAppUrl = String(process.env.INVITE_APP_URL || frontendUrl || 'http://localhost:5173').trim();
+const hasSmtpConfig = Boolean(smtpHost && smtpPort && smtpUser && smtpPass && inviteEmailFrom);
+const mailTransporter = hasSmtpConfig
+  ? nodemailer.createTransport({
+    host: smtpHost,
+    port: smtpPort,
+    secure: smtpSecure,
+    auth: {
+      user: smtpUser,
+      pass: smtpPass
+    }
+  })
+  : null;
 const hasGoogleOAuth =
   Boolean(process.env.GOOGLE_CLIENT_ID) &&
   Boolean(process.env.GOOGLE_CLIENT_SECRET) &&
@@ -52,6 +73,7 @@ async function initDatabase() {
   await usersCollection.createIndex({ googleId: 1 }, { unique: true });
   await usersCollection.createIndex({ email: 1 }, { unique: true });
   await projectsCollection.createIndex({ user_id: 1, created_at: -1 });
+  await projectsCollection.createIndex({ collaborator_ids: 1 });
   await apisCollection.createIndex({ project_id: 1, created_at: -1 });
   await apiResponsesCollection.createIndex({ api_id: 1, created_at: -1 });
   await apiCurlsCollection.createIndex({ api_id: 1, created_at: -1 });
@@ -64,13 +86,14 @@ async function upsertUserInDatabase(user) {
   if (!usersCollection) return null;
 
   const now = new Date();
+  const normalizedEmail = normalizeEmail(user.email);
   await usersCollection.updateOne(
     { googleId: user.id },
     {
       $set: {
         googleId: user.id,
         name: user.name,
-        email: user.email,
+        email: normalizedEmail,
         picture: user.picture || null,
         updatedAt: now,
         lastLoginAt: now
@@ -361,6 +384,124 @@ function parseObjectId(id) {
   return new ObjectId(id);
 }
 
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function withSingleTrailingSlash(url) {
+  return `${String(url || '').replace(/\/+$/, '')}/`;
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function sendCollaboratorInviteEmail({
+  toEmail,
+  toName = '',
+  ownerName = 'A team member',
+  projectName = 'a project',
+  addedAsCollaborator = false
+}) {
+  if (!mailTransporter) {
+    return { sent: false, reason: 'smtp_not_configured' };
+  }
+
+  const safeToEmail = normalizeEmail(toEmail);
+  if (!safeToEmail) {
+    return { sent: false, reason: 'invalid_email' };
+  }
+
+  const safeInviteUrl = withSingleTrailingSlash(inviteAppUrl);
+  const subject = addedAsCollaborator
+    ? `${ownerName} added you to "${projectName}" on API Runner`
+    : `${ownerName} invited you to join "${projectName}" on API Runner`;
+  const greeting = toName ? `Hi ${escapeHtml(toName)},` : 'Hi,';
+  const intro = addedAsCollaborator
+    ? `You were added as a collaborator on <b>${escapeHtml(projectName)}</b>.`
+    : `You are invited to collaborate on <b>${escapeHtml(projectName)}</b>.`;
+
+  await mailTransporter.sendMail({
+    from: `"${inviteFromName}" <${inviteEmailFrom}>`,
+    to: safeToEmail,
+    subject,
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827">
+        <p>${greeting}</p>
+        <p>${escapeHtml(ownerName)} has sent you an invite from API Runner.</p>
+        <p>${intro}</p>
+        <p>
+          Open API Runner:
+          <a href="${safeInviteUrl}" target="_blank" rel="noreferrer">${safeInviteUrl}</a>
+        </p>
+        <p style="margin-top:20px">Thanks,<br/>API Runner Team</p>
+      </div>
+    `,
+    text: `${toName ? `Hi ${toName},` : 'Hi,'}
+
+${ownerName} has sent you an invite from API Runner.
+${addedAsCollaborator ? `You were added as a collaborator on "${projectName}".` : `You are invited to collaborate on "${projectName}".`}
+Open API Runner: ${safeInviteUrl}
+
+Thanks,
+API Runner Team`
+  });
+
+  return { sent: true };
+}
+
+async function getProjectAccessByProjectId(projectId, userId) {
+  const projectObjectId = parseObjectId(projectId);
+  if (!projectObjectId) {
+    return { error: 'Invalid project id', statusCode: 400 };
+  }
+
+  const project = await projectsCollection.findOne({ _id: projectObjectId });
+  if (!project) {
+    return { error: 'Project not found', statusCode: 404 };
+  }
+
+  const ownerId = String(project.user_id || '');
+  const collaboratorIds = Array.isArray(project.collaborator_ids) ? project.collaborator_ids.map(String) : [];
+  const role = ownerId === String(userId)
+    ? 'owner'
+    : (collaboratorIds.includes(String(userId)) ? 'collaborator' : null);
+
+  if (!role) {
+    return { error: 'Access denied', statusCode: 403 };
+  }
+
+  return { project, role, projectObjectId };
+}
+
+async function getApiWithProjectAccess(apiId, userId) {
+  const apiObjectId = parseObjectId(apiId);
+  if (!apiObjectId) {
+    return { error: 'Invalid api id', statusCode: 400 };
+  }
+
+  const api = await apisCollection.findOne({ _id: apiObjectId });
+  if (!api) {
+    return { error: 'API not found', statusCode: 404 };
+  }
+
+  const access = await getProjectAccessByProjectId(api.project_id, userId);
+  if (access.error) {
+    return access;
+  }
+
+  return { ...access, api, apiObjectId };
+}
+
 async function saveRunHistory(entry) {
   if (!runHistoryCollection) return;
   await runHistoryCollection.insertOne(entry);
@@ -378,7 +519,12 @@ async function saveApiCurl(entry) {
 
 app.get('/api/projects', ensureAuth, async (req, res) => {
   const projects = await projectsCollection
-    .find({ user_id: req.userId })
+    .find({
+      $or: [
+        { user_id: req.userId },
+        { collaborator_ids: req.userId }
+      ]
+    })
     .sort({ created_at: -1 })
     .toArray();
   res.json(projects);
@@ -392,6 +538,7 @@ app.post('/api/projects', ensureAuth, async (req, res) => {
   const now = new Date();
   const doc = {
     user_id: req.userId,
+    collaborator_ids: [],
     name: String(name).trim(),
     description: String(description || '').trim(),
     base_url: String(base_url || '').trim(),
@@ -409,19 +556,18 @@ app.delete('/api/projects/:projectId', ensureAuth, async (req, res) => {
   const project = await projectsCollection.findOne({ _id: projectObjectId, user_id: req.userId });
   if (!project) return res.status(404).json({ error: 'Project not found' });
 
-  const projectApis = await apisCollection.find({ project_id: projectId, user_id: req.userId }).project({ _id: 1 }).toArray();
+  const projectApis = await apisCollection.find({ project_id: projectId }).project({ _id: 1 }).toArray();
   const apiIds = projectApis.map((api) => String(api._id));
 
   await projectsCollection.deleteOne({ _id: projectObjectId, user_id: req.userId });
-  await apisCollection.deleteMany({ project_id: projectId, user_id: req.userId });
+  await apisCollection.deleteMany({ project_id: projectId });
 
   if (apiIds.length > 0) {
-    await apiResponsesCollection.deleteMany({ api_id: { $in: apiIds }, user_id: req.userId });
-    await apiCurlsCollection.deleteMany({ api_id: { $in: apiIds }, user_id: req.userId });
+    await apiResponsesCollection.deleteMany({ api_id: { $in: apiIds } });
+    await apiCurlsCollection.deleteMany({ api_id: { $in: apiIds } });
   }
 
   await runHistoryCollection.deleteMany({
-    user_id: req.userId,
     $or: [
       { project_id: projectId },
       ...(apiIds.length > 0 ? [{ api_id: { $in: apiIds } }] : [])
@@ -433,12 +579,10 @@ app.delete('/api/projects/:projectId', ensureAuth, async (req, res) => {
 
 app.get('/api/projects/:projectId/apis', ensureAuth, async (req, res) => {
   const { projectId } = req.params;
-  const projectObjectId = parseObjectId(projectId);
-  if (!projectObjectId) return res.status(400).json({ error: 'Invalid project id' });
-  const project = await projectsCollection.findOne({ _id: projectObjectId, user_id: req.userId });
-  if (!project) return res.status(404).json({ error: 'Project not found' });
+  const access = await getProjectAccessByProjectId(projectId, req.userId);
+  if (access.error) return res.status(access.statusCode).json({ error: access.error });
   const apis = await apisCollection
-    .find({ project_id: projectId, user_id: req.userId })
+    .find({ project_id: projectId })
     .sort({ created_at: -1 })
     .toArray();
   res.json(apis);
@@ -446,6 +590,8 @@ app.get('/api/projects/:projectId/apis', ensureAuth, async (req, res) => {
 
 app.post('/api/projects/:projectId/apis', ensureAuth, async (req, res) => {
   const { projectId } = req.params;
+  const access = await getProjectAccessByProjectId(projectId, req.userId);
+  if (access.error) return res.status(access.statusCode).json({ error: access.error });
   const {
     name,
     method = 'GET',
@@ -465,7 +611,8 @@ app.post('/api/projects/:projectId/apis', ensureAuth, async (req, res) => {
 
   const now = new Date();
   const doc = {
-    user_id: req.userId,
+    user_id: String(access.project.user_id || req.userId),
+    created_by: req.userId,
     project_id: projectId,
     name: String(name).trim(),
     method: String(method || 'GET').toUpperCase(),
@@ -491,8 +638,9 @@ app.post('/api/projects/:projectId/apis', ensureAuth, async (req, res) => {
 
 app.put('/api/apis/:apiId', ensureAuth, async (req, res) => {
   const { apiId } = req.params;
-  const apiObjectId = parseObjectId(apiId);
-  if (!apiObjectId) return res.status(400).json({ error: 'Invalid api id' });
+  const apiAccess = await getApiWithProjectAccess(apiId, req.userId);
+  if (apiAccess.error) return res.status(apiAccess.statusCode).json({ error: apiAccess.error });
+  const { apiObjectId } = apiAccess;
   const updates = req.body || {};
   const updateDoc = {
     ...(updates.name ? { name: String(updates.name).trim() } : {}),
@@ -514,35 +662,35 @@ app.put('/api/apis/:apiId', ensureAuth, async (req, res) => {
   };
 
   await apisCollection.updateOne(
-    { _id: apiObjectId, user_id: req.userId },
+    { _id: apiObjectId },
     { $set: updateDoc }
   );
 
-  const api = await apisCollection.findOne({ _id: apiObjectId, user_id: req.userId });
+  const api = await apisCollection.findOne({ _id: apiObjectId });
   if (!api) return res.status(404).json({ error: 'API not found' });
   res.json(api);
 });
 
 app.delete('/api/apis/:apiId', ensureAuth, async (req, res) => {
   const { apiId } = req.params;
-  const apiObjectId = parseObjectId(apiId);
-  if (!apiObjectId) return res.status(400).json({ error: 'Invalid api id' });
+  const apiAccess = await getApiWithProjectAccess(apiId, req.userId);
+  if (apiAccess.error) return res.status(apiAccess.statusCode).json({ error: apiAccess.error });
+  const { apiObjectId } = apiAccess;
 
-  const existing = await apisCollection.findOne({ _id: apiObjectId, user_id: req.userId });
-  if (!existing) return res.status(404).json({ error: 'API not found' });
-
-  await apisCollection.deleteOne({ _id: apiObjectId, user_id: req.userId });
-  await apiResponsesCollection.deleteMany({ api_id: apiId, user_id: req.userId });
-  await apiCurlsCollection.deleteMany({ api_id: apiId, user_id: req.userId });
-  await runHistoryCollection.deleteMany({ api_id: apiId, user_id: req.userId });
+  await apisCollection.deleteOne({ _id: apiObjectId });
+  await apiResponsesCollection.deleteMany({ api_id: apiId });
+  await apiCurlsCollection.deleteMany({ api_id: apiId });
+  await runHistoryCollection.deleteMany({ api_id: apiId });
 
   res.json({ success: true, deleted_api_id: apiId });
 });
 
 app.get('/api/apis/:apiId/history', ensureAuth, async (req, res) => {
   const { apiId } = req.params;
+  const apiAccess = await getApiWithProjectAccess(apiId, req.userId);
+  if (apiAccess.error) return res.status(apiAccess.statusCode).json({ error: apiAccess.error });
   const history = await apiResponsesCollection
-    .find({ api_id: apiId, user_id: req.userId })
+    .find({ api_id: apiId })
     .sort({ created_at: -1 })
     .limit(100)
     .toArray();
@@ -551,8 +699,10 @@ app.get('/api/apis/:apiId/history', ensureAuth, async (req, res) => {
 
 app.get('/api/apis/:apiId/curls', ensureAuth, async (req, res) => {
   const { apiId } = req.params;
+  const apiAccess = await getApiWithProjectAccess(apiId, req.userId);
+  if (apiAccess.error) return res.status(apiAccess.statusCode).json({ error: apiAccess.error });
   const curls = await apiCurlsCollection
-    .find({ api_id: apiId, user_id: req.userId })
+    .find({ api_id: apiId })
     .sort({ created_at: -1 })
     .limit(100)
     .toArray();
@@ -592,12 +742,11 @@ app.delete('/api/history/:historyId', ensureAuth, async (req, res) => {
 app.get('/api/projects/:projectId/export', ensureAuth, async (req, res) => {
   const { projectId } = req.params;
   const format = String(req.query.format || 'excel').toLowerCase();
-  const projectObjectId = parseObjectId(projectId);
-  if (!projectObjectId) return res.status(400).json({ error: 'Invalid project id' });
-  const project = await projectsCollection.findOne({ _id: projectObjectId, user_id: req.userId });
-  if (!project) return res.status(404).json({ error: 'Project not found' });
+  const access = await getProjectAccessByProjectId(projectId, req.userId);
+  if (access.error) return res.status(access.statusCode).json({ error: access.error });
+  const { project } = access;
 
-  const apis = await apisCollection.find({ project_id: projectId, user_id: req.userId }).toArray();
+  const apis = await apisCollection.find({ project_id: projectId }).toArray();
 
   if (format === 'curl') {
     const lines = apis.map((api) => buildCurlCommandByMode({
@@ -622,7 +771,7 @@ app.get('/api/projects/:projectId/export', ensureAuth, async (req, res) => {
 
     for (const api of apis) {
       const latestResponse = await apiResponsesCollection.findOne(
-        { api_id: String(api._id), user_id: req.userId },
+        { api_id: String(api._id) },
         { sort: { created_at: -1 } }
       );
       lines.push(`- ${api.method || 'GET'} ${api.endpoint || ''} (${api.name || 'Unnamed API'})`);
@@ -641,7 +790,7 @@ app.get('/api/projects/:projectId/export', ensureAuth, async (req, res) => {
 
   for (const api of apis) {
     const latestResponse = await apiResponsesCollection.findOne(
-      { api_id: String(api._id), user_id: req.userId },
+      { api_id: String(api._id) },
       { sort: { created_at: -1 } }
     );
     const requestSummary = JSON.stringify({
@@ -660,15 +809,9 @@ app.get('/api/projects/:projectId/export', ensureAuth, async (req, res) => {
 
 app.post('/api/apis/:apiId/run', ensureAuth, async (req, res) => {
   const { apiId } = req.params;
-  const apiObjectId = parseObjectId(apiId);
-  if (!apiObjectId) return res.status(400).json({ error: 'Invalid api id' });
-  const api = await apisCollection.findOne({ _id: apiObjectId, user_id: req.userId });
-  if (!api) return res.status(404).json({ error: 'API not found' });
-
-  const projectObjectId = parseObjectId(api.project_id);
-  if (!projectObjectId) return res.status(400).json({ error: 'Invalid linked project id' });
-  const project = await projectsCollection.findOne({ _id: projectObjectId, user_id: req.userId });
-  if (!project) return res.status(400).json({ error: 'Project not found for API' });
+  const apiAccess = await getApiWithProjectAccess(apiId, req.userId);
+  if (apiAccess.error) return res.status(apiAccess.statusCode).json({ error: apiAccess.error });
+  const { api, project, apiObjectId } = apiAccess;
 
   const overrides = req.body || {};
   const method = String(overrides.method || api.method || 'GET').toUpperCase();
@@ -723,7 +866,7 @@ app.post('/api/apis/:apiId/run', ensureAuth, async (req, res) => {
   });
 
   await apisCollection.updateOne(
-    { _id: apiObjectId, user_id: req.userId },
+    { _id: apiObjectId },
     {
       $set: {
         last_response_body: responsePayload.body,
@@ -761,6 +904,126 @@ app.post('/api/apis/:apiId/run', ensureAuth, async (req, res) => {
   });
 
   return res.json(responsePayload);
+});
+
+app.get('/api/projects/:projectId/collaborators', ensureAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const access = await getProjectAccessByProjectId(projectId, req.userId);
+  if (access.error) return res.status(access.statusCode).json({ error: access.error });
+
+  const { project, role } = access;
+  const userIds = [String(project.user_id || ''), ...(project.collaborator_ids || []).map(String)].filter(Boolean);
+  const objectIds = userIds.map((id) => parseObjectId(id)).filter(Boolean);
+  const users = objectIds.length > 0
+    ? await usersCollection.find({ _id: { $in: objectIds } }).project({ _id: 1, name: 1, email: 1, picture: 1 }).toArray()
+    : [];
+  const userMap = new Map(users.map((item) => [String(item._id), item]));
+  const collaborators = userIds.map((id) => {
+    const info = userMap.get(id) || null;
+    return {
+      user_id: id,
+      name: info?.name || null,
+      email: info?.email || null,
+      picture: info?.picture || null,
+      role: id === String(project.user_id || '') ? 'owner' : 'collaborator'
+    };
+  });
+
+  return res.json({ role, collaborators });
+});
+
+app.post('/api/projects/:projectId/collaborators', ensureAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const access = await getProjectAccessByProjectId(projectId, req.userId);
+  if (access.error) return res.status(access.statusCode).json({ error: access.error });
+  if (access.role !== 'owner') return res.status(403).json({ error: 'Only project owner can add collaborators' });
+
+  const email = normalizeEmail(req.body?.email);
+  if (!email) return res.status(400).json({ error: 'Collaborator email is required' });
+
+  const invitee = await usersCollection.findOne(
+    { $or: [{ email }, { email: new RegExp(`^${escapeRegex(email)}$`, 'i') }] },
+    { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
+  );
+
+  const ownerName = String(req.user?.name || 'Project owner').trim();
+  const projectName = String(access.project?.name || 'Untitled Project').trim();
+
+  if (!invitee) {
+    try {
+      await sendCollaboratorInviteEmail({
+        toEmail: email,
+        ownerName,
+        projectName,
+        addedAsCollaborator: false
+      });
+    } catch (error) {
+      return res.status(500).json({ error: 'Invite email failed', details: error.message });
+    }
+
+    return res.status(202).json({
+      success: true,
+      invited: true,
+      message: 'Invite email sent. User can join after signing in.'
+    });
+  }
+
+  const inviteeId = String(invitee._id);
+  if (inviteeId === String(access.project.user_id || '')) {
+    return res.status(400).json({ error: 'Owner is already part of this project' });
+  }
+
+  const addResult = await projectsCollection.updateOne(
+    { _id: access.projectObjectId, user_id: req.userId },
+    { $addToSet: { collaborator_ids: inviteeId } }
+  );
+
+  try {
+    await sendCollaboratorInviteEmail({
+      toEmail: invitee.email || email,
+      toName: invitee.name || '',
+      ownerName,
+      projectName,
+      addedAsCollaborator: true
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Collaborator added but email failed', details: error.message });
+  }
+
+  return res.status(201).json({
+    success: true,
+    invited: true,
+    message: addResult.modifiedCount > 0 ? 'Collaborator added and invite email sent' : 'User is already a collaborator; invite email sent',
+    collaborator: {
+      user_id: inviteeId,
+      name: invitee.name || null,
+      email: invitee.email || email,
+      picture: invitee.picture || null,
+      role: 'collaborator'
+    },
+    alreadyCollaborator: addResult.modifiedCount === 0
+  });
+});
+
+app.delete('/api/projects/:projectId/collaborators/:collaboratorUserId', ensureAuth, async (req, res) => {
+  const { projectId, collaboratorUserId } = req.params;
+  const access = await getProjectAccessByProjectId(projectId, req.userId);
+  if (access.error) return res.status(access.statusCode).json({ error: access.error });
+  if (access.role !== 'owner') return res.status(403).json({ error: 'Only project owner can remove collaborators' });
+
+  if (!parseObjectId(collaboratorUserId)) {
+    return res.status(400).json({ error: 'Invalid collaborator user id' });
+  }
+  if (String(collaboratorUserId) === String(access.project.user_id || '')) {
+    return res.status(400).json({ error: 'Owner cannot be removed' });
+  }
+
+  await projectsCollection.updateOne(
+    { _id: access.projectObjectId, user_id: req.userId },
+    { $pull: { collaborator_ids: String(collaboratorUserId) } }
+  );
+
+  return res.json({ success: true, removed_user_id: String(collaboratorUserId) });
 });
 
 app.post('/api/proxy-request', async (req, res) => {
@@ -874,6 +1137,7 @@ app.use((req, res) => {
     app.listen(port, () => {
       console.log(`API Tracker running at http://localhost:${port}`);
       console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
+      console.log(hasSmtpConfig ? 'Invite Email: Configured' : 'Invite Email: Not configured');
     });
   } catch (error) {
     console.error('Database initialization failed:', error.message);
