@@ -5,6 +5,7 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const { MongoClient, ObjectId } = require('mongodb');
 const { normalizeRequestBodyForUpstream, parseFormDataLines, formDataObjectToLines, formFilesToLines } = require('./requestBody');
 
@@ -864,11 +865,28 @@ app.post('/api/track', (req, res) => {
   res.json({ message: 'API call tracked', data: req.body, user: req.user || null });
 });
 
-// Serve Frontend - Prod (dist) or fallback HTML
-app.use(express.static(path.join(__dirname, 'frontend/dist')));
+// Serve Frontend only when build exists.
+const frontendDistPath = path.join(__dirname, 'frontend', 'dist');
+const frontendIndexPath = path.join(frontendDistPath, 'index.html');
+const hasFrontendBuild = fs.existsSync(frontendIndexPath);
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'frontend/dist/index.html'));
+if (hasFrontendBuild) {
+  app.use(express.static(frontendDistPath));
+
+  // React Router fallback (skip API/Auth routes).
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/auth')) {
+      return next();
+    }
+    return res.sendFile(frontendIndexPath);
+  });
+} else {
+  console.warn('Frontend build not found at frontend/dist. Running in API-only mode.');
+}
+
+// Final 404 for unmatched API/Auth/other routes.
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
 });
 
 (async () => {
