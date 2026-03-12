@@ -412,11 +412,11 @@ async function sendCollaboratorInviteEmail({
   projectName = 'a project',
   addedAsCollaborator = false
 }) {
+  const safeToEmail = normalizeEmail(toEmail);
   if (!mailTransporter) {
+    console.log(`SMTP ERROR: No transporter - check SMTP config. Skipping email to ${safeToEmail}`);
     return { sent: false, reason: 'smtp_not_configured' };
   }
-
-  const safeToEmail = normalizeEmail(toEmail);
   if (!safeToEmail) {
     return { sent: false, reason: 'invalid_email' };
   }
@@ -430,6 +430,7 @@ async function sendCollaboratorInviteEmail({
     ? `You were added as a collaborator on <b>${escapeHtml(projectName)}</b>.`
     : `You are invited to collaborate on <b>${escapeHtml(projectName)}</b>.`;
 
+console.log(`SMTP: Sending email to ${safeToEmail}, subject: "${subject}", from: ${inviteEmailFrom}`);
   await mailTransporter.sendMail({
     from: `"${inviteFromName}" <${inviteEmailFrom}>`,
     to: safeToEmail,
@@ -456,6 +457,7 @@ Thanks,
 API Runner Team`
   });
 
+  console.log(`SMTP: SUCCESS - Email sent to ${safeToEmail}`);
   return { sent: true };
 }
 
@@ -956,12 +958,13 @@ app.post('/api/projects/:projectId/collaborators', ensureAuth, async (req, res) 
         ownerName,
         projectName,
         addedAsCollaborator: false
-      });
-    } catch (error) {
-      return res.status(500).json({ error: 'Invite email failed', details: error.message });
-    }
+  });
+} catch (error) {
+  console.error(`ROUTE ERROR: Invite email failed for new user ${email}:`, error.message || error, error.stack);
+  return res.status(500).json({ error: 'Invite email failed', details: error.message });
+}
 
-    return res.status(202).json({
+return res.status(202).json({
       success: true,
       invited: true,
       message: 'Invite email sent. User can join after signing in.'
@@ -985,12 +988,13 @@ app.post('/api/projects/:projectId/collaborators', ensureAuth, async (req, res) 
       ownerName,
       projectName,
       addedAsCollaborator: true
-    });
-  } catch (error) {
-    return res.status(500).json({ error: 'Collaborator added but email failed', details: error.message });
-  }
+  });
+} catch (error) {
+  console.error(`ROUTE ERROR: Added collaborator ${invitee.email} email failed:`, error.message || error, error.stack);
+  return res.status(500).json({ error: 'Collaborator added but email failed', details: error.message });
+}
 
-  return res.status(201).json({
+return res.status(201).json({
     success: true,
     invited: true,
     message: addResult.modifiedCount > 0 ? 'Collaborator added and invite email sent' : 'User is already a collaborator; invite email sent',
@@ -1137,7 +1141,7 @@ app.use((req, res) => {
     app.listen(port, () => {
       console.log(`API Tracker running at http://localhost:${port}`);
       console.log(hasGoogleOAuth ? 'Google Auth: Configured' : 'Google Auth: Not configured');
-      console.log(hasSmtpConfig ? 'Invite Email: Configured' : 'Invite Email: Not configured');
+console.log(`Invite Email: ${hasSmtpConfig ? `Configured (host:${smtpHost}, port:${smtpPort}, user:${smtpUser.slice(0,3)}***, from:${inviteEmailFrom})` : 'NOT CONFIGURED - Add SMTP_HOST,SMTP_PORT,SMTP_USER,SMTP_PASS,INVITE_EMAIL_FROM to Backend/.env'}`);
     });
   } catch (error) {
     console.error('Database initialization failed:', error.message);
