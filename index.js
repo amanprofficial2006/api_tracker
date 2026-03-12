@@ -162,7 +162,7 @@ app.get('/auth/google/callback',
   },
   (req, res) => {
     // Success - hand control back to client app; user is restored from session.
-    res.redirect(`${frontendUrl}/dashboard`);
+    res.redirect(`${frontendUrl}/#/dashboard`);
   }
 );
 
