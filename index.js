@@ -938,78 +938,102 @@ app.get('/api/projects/:projectId/collaborators', ensureAuth, async (req, res) =
 });
 
 app.post('/api/projects/:projectId/collaborators', ensureAuth, async (req, res) => {
-  const { projectId } = req.params;
-  const access = await getProjectAccessByProjectId(projectId, req.userId);
-  if (access.error) return res.status(access.statusCode).json({ error: access.error });
-  if (access.role !== 'owner') return res.status(403).json({ error: 'Only project owner can add collaborators' });
+  try {
+    // Defensive: Ensure DB collections are initialized
+    if (!usersCollection || !projectsCollection) {
+      return res.status(500).json({ error: 'Database not initialized' });
+    }
 
-  const email = normalizeEmail(req.body?.email);
-  if (!email) return res.status(400).json({ error: 'Collaborator email is required' });
+    const { projectId } = req.params;
+    const access = await getProjectAccessByProjectId(projectId, req.userId);
+    if (access.error) return res.status(access.statusCode).json({ error: access.error });
+    if (access.role !== 'owner') return res.status(403).json({ error: 'Only project owner can add collaborators' });
 
-  const invitee = await usersCollection.findOne(
-    { $or: [{ email }, { email: new RegExp(`^${escapeRegex(email)}$`, 'i') }] },
-    { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
-  );
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({ error: 'Missing request body' });
+    }
+    const email = normalizeEmail(req.body.email);
+    if (!email) return res.status(400).json({ error: 'Collaborator email is required' });
 
-  const ownerName = String(req.user?.name || 'Project owner').trim();
-  const projectName = String(access.project?.name || 'Untitled Project').trim();
+    let invitee;
+    try {
+      invitee = await usersCollection.findOne(
+        { $or: [{ email }, { email: new RegExp(`^${escapeRegex(email)}$`, 'i') }] },
+        { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
+      );
+    } catch (err) {
+      console.error('DB ERROR: Failed to query usersCollection:', err);
+      return res.status(500).json({ error: 'Database error', details: err.message });
+    }
 
-  if (!invitee) {
+    const ownerName = String(req.user?.name || 'Project owner').trim();
+    const projectName = String(access.project?.name || 'Untitled Project').trim();
+
+    if (!invitee) {
+      try {
+        await sendCollaboratorInviteEmail({
+          toEmail: email,
+          ownerName,
+          projectName,
+          addedAsCollaborator: false
+        });
+      } catch (error) {
+        console.error(`ROUTE ERROR: Invite email failed for new user ${email}:`, error);
+        return res.status(500).json({ error: 'Invite email failed', details: error.message || error });
+      }
+      return res.status(202).json({
+        success: true,
+        invited: true,
+        message: 'Invite email sent. User can join after signing in.'
+      });
+    }
+
+    const inviteeId = String(invitee._id);
+    if (inviteeId === String(access.project.user_id || '')) {
+      return res.status(400).json({ error: 'Owner is already part of this project' });
+    }
+
+    let addResult;
+    try {
+      addResult = await projectsCollection.updateOne(
+        { _id: access.projectObjectId, user_id: req.userId },
+        { $addToSet: { collaborator_ids: inviteeId } }
+      );
+    } catch (err) {
+      console.error('DB ERROR: Failed to update project collaborators:', err);
+      return res.status(500).json({ error: 'Database error', details: err.message });
+    }
+
     try {
       await sendCollaboratorInviteEmail({
-        toEmail: email,
+        toEmail: invitee.email || email,
+        toName: invitee.name || '',
         ownerName,
         projectName,
-        addedAsCollaborator: false
-  });
-} catch (error) {
-  console.error(`ROUTE ERROR: Invite email failed for new user ${email}:`, error.message || error, error.stack);
-  return res.status(500).json({ error: 'Invite email failed', details: error.message });
-}
+        addedAsCollaborator: true
+      });
+    } catch (error) {
+      console.error(`ROUTE ERROR: Added collaborator ${invitee.email} email failed:`, error);
+      return res.status(500).json({ error: 'Collaborator added but email failed', details: error.message || error });
+    }
 
-return res.status(202).json({
+    return res.status(201).json({
       success: true,
       invited: true,
-      message: 'Invite email sent. User can join after signing in.'
+      message: addResult.modifiedCount > 0 ? 'Collaborator added and invite email sent' : 'User is already a collaborator; invite email sent',
+      collaborator: {
+        user_id: inviteeId,
+        name: invitee.name || null,
+        email: invitee.email || email,
+        picture: invitee.picture || null,
+        role: 'collaborator'
+      },
+      alreadyCollaborator: addResult.modifiedCount === 0
     });
+  } catch (err) {
+    console.error('ROUTE ERROR: Unexpected error in add collaborator:', err);
+    return res.status(500).json({ error: 'Internal server error', details: err.message || err });
   }
-
-  const inviteeId = String(invitee._id);
-  if (inviteeId === String(access.project.user_id || '')) {
-    return res.status(400).json({ error: 'Owner is already part of this project' });
-  }
-
-  const addResult = await projectsCollection.updateOne(
-    { _id: access.projectObjectId, user_id: req.userId },
-    { $addToSet: { collaborator_ids: inviteeId } }
-  );
-
-  try {
-    await sendCollaboratorInviteEmail({
-      toEmail: invitee.email || email,
-      toName: invitee.name || '',
-      ownerName,
-      projectName,
-      addedAsCollaborator: true
-  });
-} catch (error) {
-  console.error(`ROUTE ERROR: Added collaborator ${invitee.email} email failed:`, error.message || error, error.stack);
-  return res.status(500).json({ error: 'Collaborator added but email failed', details: error.message });
-}
-
-return res.status(201).json({
-    success: true,
-    invited: true,
-    message: addResult.modifiedCount > 0 ? 'Collaborator added and invite email sent' : 'User is already a collaborator; invite email sent',
-    collaborator: {
-      user_id: inviteeId,
-      name: invitee.name || null,
-      email: invitee.email || email,
-      picture: invitee.picture || null,
-      role: 'collaborator'
-    },
-    alreadyCollaborator: addResult.modifiedCount === 0
-  });
 });
 
 app.delete('/api/projects/:projectId/collaborators/:collaboratorUserId', ensureAuth, async (req, res) => {
